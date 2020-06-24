@@ -116,12 +116,6 @@ class S3MultipartUpload(MultipartUpload):
 
 class S3Client(FileSystemClient):
 
-    _MIN_CHUNK = 1
-    _MAX_CHUNK = 10000
-    _MIN_PART_SIZE = 5 * MB
-    _MAX_PART_SIZE = 5 * GB
-    _SINGLE_UPLOAD_SIZE = 5 * MB
-
     def __init__(self, bucket, pipe, chunk_size):
         """
         AWS S3 API client for single bucket operations.
@@ -138,6 +132,11 @@ class S3Client(FileSystemClient):
         self.root_path = self._delimiter.join(path_chunks[1:]) if len(path_chunks) > 1 else ''
         self._s3 = self._generate_s3_client(bucket, pipe)
         self._chunk_size = chunk_size
+        self._min_chunk = 1
+        self._max_chunk = 10000
+        self._min_part_size = 5 * MB
+        self._max_part_size = 5 * GB
+        self._single_upload_size = 5 * MB
         self._mpus = {}
 
     def _generate_s3_client(self, bucket, pipe):
@@ -305,7 +304,7 @@ class S3Client(FileSystemClient):
             if not mpu:
                 file_size = self.attrs(path).size
                 buf_size = len(buf)
-                if buf_size < self._SINGLE_UPLOAD_SIZE and file_size < self._SINGLE_UPLOAD_SIZE:
+                if buf_size < self._single_upload_size and file_size < self._single_upload_size:
                     logging.info('Using single range upload approach')
                     self._upload_single_range(fh, buf, source_path, offset, file_size)
                 else:
@@ -324,17 +323,17 @@ class S3Client(FileSystemClient):
 
     def _new_mpu(self, source_path, file_size):
         mpu = S3MultipartUpload(source_path, self.bucket, self._s3)
-        mpu = SplittingMultipartCopyUpload(mpu, min_part_size=self._MIN_PART_SIZE, max_part_size=self._MAX_PART_SIZE)
-        mpu = ChunkedMultipartUpload(mpu, file_size, download=self._generate_region_download_function(source_path),
-                                     chunk_size=self._chunk_size, min_chunk=self._MIN_CHUNK, max_chunk=self._MAX_CHUNK)
+        mpu = SplittingMultipartCopyUpload(mpu, min_part_size=self._min_part_size, max_part_size=self._max_part_size)
+        mpu = ChunkedMultipartUpload(mpu, file_size, download=self._generate_region_download_function(),
+                                     chunk_size=self._chunk_size, min_chunk=self._min_chunk, max_chunk=self._max_chunk)
         return mpu
 
-    def _generate_region_download_function(self, path):
-        def download_func(region_offset, region_length):
+    def _generate_region_download_function(self):
+        def download(path, region_offset, region_length):
             with io.BytesIO() as buf:
                 self.download_range(None, buf, path, region_offset, region_length, expand_path=False)
                 return buf.getvalue()
-        return download_func
+        return download
 
     def _upload_single_range(self, fh, buf, path, offset, file_size):
         if file_size:
