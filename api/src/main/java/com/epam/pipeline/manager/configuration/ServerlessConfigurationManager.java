@@ -19,20 +19,21 @@ package com.epam.pipeline.manager.configuration;
 import com.epam.pipeline.config.JsonMapper;
 import com.epam.pipeline.controller.vo.PagingRunFilterVO;
 import com.epam.pipeline.controller.vo.ServiceUrlVO;
-import com.epam.pipeline.dao.pipeline.StopServerlessRunDao;
 import com.epam.pipeline.entity.configuration.AbstractRunConfigurationEntry;
 import com.epam.pipeline.entity.configuration.RunConfiguration;
 import com.epam.pipeline.entity.pipeline.PipelineRun;
 import com.epam.pipeline.entity.pipeline.StopServerlessRun;
 import com.epam.pipeline.entity.pipeline.TaskStatus;
 import com.epam.pipeline.manager.pipeline.PipelineRunManager;
+import com.epam.pipeline.manager.pipeline.StopServerlessRunManager;
 import com.epam.pipeline.manager.pipeline.runner.ConfigurationRunner;
 import com.epam.pipeline.manager.preference.PreferenceManager;
 import com.epam.pipeline.manager.preference.SystemPreferences;
+import com.epam.pipeline.manager.security.AuthManager;
 import com.epam.pipeline.mapper.AbstractRunConfigurationMapper;
+import com.epam.pipeline.security.UserContext;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.collections4.ListUtils;
@@ -42,6 +43,7 @@ import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
 import org.apache.http.conn.ssl.TrustStrategy;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.web.client.RestTemplateBuilder;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -49,22 +51,25 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.client.HttpComponentsClientHttpRequestFactory;
+import org.springframework.security.web.util.UrlUtils;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Propagation;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.Assert;
 import org.springframework.web.client.HttpServerErrorException;
 import org.springframework.web.client.RestTemplate;
 
 import javax.net.ssl.SSLContext;
+import javax.servlet.http.Cookie;
 import javax.servlet.http.HttpServletRequest;
 import java.io.IOException;
+import java.net.MalformedURLException;
+import java.net.URL;
 import java.nio.charset.Charset;
 import java.security.KeyManagementException;
 import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
 import java.security.cert.X509Certificate;
 import java.time.LocalDateTime;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
@@ -73,23 +78,48 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class ServerlessConfigurationManager {
 
     private static final int REQUEST_TIMEOUT = 30 * 1000;
     private static final int DEFAULT_PAGE = 1;
     private static final int DEFAULT_PAGE_SIZE = 20;
+    private static final String BEARER_COOKIE_NAME = "bearer";
+    private static final String PATH_DELIMITER = "/";
 
     private final RunConfigurationManager runConfigurationManager;
     private final ConfigurationRunner configurationRunner;
     private final AbstractRunConfigurationMapper runConfigurationMapper;
     private final PipelineRunManager runManager;
     private final PreferenceManager preferenceManager;
-    private final StopServerlessRunDao stopServerlessRunDao;
+    private final StopServerlessRunManager stopServerlessRunManager;
     private final ObjectMapper objectMapper;
+    private final AuthManager authManager;
+    private final String edgeInternalHost;
+    private final Integer edgeInternalPort;
 
-    @Transactional(propagation = Propagation.REQUIRED)
+    public ServerlessConfigurationManager(final RunConfigurationManager runConfigurationManager,
+                                          final ConfigurationRunner configurationRunner,
+                                          final AbstractRunConfigurationMapper runConfigurationMapper,
+                                          final PipelineRunManager runManager,
+                                          final PreferenceManager preferenceManager,
+                                          final StopServerlessRunManager stopServerlessRunManager,
+                                          final ObjectMapper objectMapper,
+                                          final AuthManager authManager,
+                                          @Value("${edge.internal.host:}") final String edgeInternalHost,
+                                          @Value("${edge.internal.port}") final Integer edgeInternalPort) {
+        this.runConfigurationManager = runConfigurationManager;
+        this.configurationRunner = configurationRunner;
+        this.runConfigurationMapper = runConfigurationMapper;
+        this.runManager = runManager;
+        this.preferenceManager = preferenceManager;
+        this.stopServerlessRunManager = stopServerlessRunManager;
+        this.objectMapper = objectMapper;
+        this.authManager = authManager;
+        this.edgeInternalHost = edgeInternalHost;
+        this.edgeInternalPort = edgeInternalPort;
+    }
+
     public String run(final Long configurationId, final String configName, final HttpServletRequest request) {
         final RunConfiguration configuration = runConfigurationManager.load(configurationId);
         final AbstractRunConfigurationEntry configurationEntry = configuration.getEntries().stream()
@@ -98,27 +128,20 @@ public class ServerlessConfigurationManager {
                 .orElseThrow(() -> new IllegalArgumentException(String
                         .format("Cannot find configuration with name '%s'", configName)));
         final PipelineRun pipelineRun = receivePipelineRun(configurationId, configuration);
+        log.debug("Pipeline run '{}' will be used for request", pipelineRun.getId());
 
-        final StopServerlessRun stopRunInfo = StopServerlessRun.builder()
-                .runId(pipelineRun.getId())
-                .lastUpdate(LocalDateTime.now())
-                .build();
-        if (configurationEntry.isStopAfter()) {
-            stopServerlessRunDao.createServerlessRun(stopRunInfo);
-        }
+        final StopServerlessRun stopRunInfo = getServerlessRun(pipelineRun.getId(), configurationEntry.getStopAfter());
 
-        waitForRunInitialized(pipelineRun);
-        final String endpointName = getEndpointUrl(configurationEntry, pipelineRun);
+        final PipelineRun launchedRun = waitForRunInitialized(pipelineRun.getId());
+        final String endpointUrl = getEndpointUrl(configurationEntry, launchedRun);
 
-        final String appPath = buildApplicationUrl(request, endpointName);
+        final String appPath = buildApplicationUrl(request, endpointUrl);
         log.debug("The request '{}' will be sent", appPath);
 
         final String response = sendRequest(request, appPath);
 
-        if (configurationEntry.isStopAfter()) {
-            stopRunInfo.setLastUpdate(LocalDateTime.now());
-            stopServerlessRunDao.updateServerlessRun(stopRunInfo);
-        }
+        stopRunInfo.setLastUpdate(LocalDateTime.now());
+        stopServerlessRunManager.updateServerlessRun(stopRunInfo);
 
         return response;
     }
@@ -131,6 +154,23 @@ public class ServerlessConfigurationManager {
                 configurationId, configName);
     }
 
+    private StopServerlessRun getServerlessRun(final Long runId, final Long stopAfter) {
+        return stopServerlessRunManager.loadByRunId(runId)
+                .map(run -> {
+                    run.setLastUpdate(LocalDateTime.now());
+                    stopServerlessRunManager.updateServerlessRun(run);
+                    return run;
+                }).orElseGet(() -> {
+                    final StopServerlessRun run = StopServerlessRun.builder()
+                            .runId(runId)
+                            .stopAfter(stopAfter)
+                            .lastUpdate(LocalDateTime.now())
+                            .build();
+                    stopServerlessRunManager.createServerlessRun(run);
+                    return run;
+                });
+    }
+
     private String getConfigurationName(final Long configurationId, final String configName) {
         return runConfigurationManager.load(configurationId).getEntries().stream()
                 .filter(entry -> StringUtils.isNotBlank(configName)
@@ -141,13 +181,14 @@ public class ServerlessConfigurationManager {
                 .getName();
     }
 
-    private void waitForRunInitialized(final PipelineRun pipelineRun) {
+    private PipelineRun waitForRunInitialized(final Long runId) {
         final Integer maxRetryCount = preferenceManager.getPreference(SystemPreferences.LAUNCH_SERVERLESS_WAIT_COUNT);
         final Integer waitTime = preferenceManager.getPreference(SystemPreferences.LAUNCH_TASK_STATUS_UPDATE_RATE);
 
         for (int i = 0; i < maxRetryCount; i++) {
-            if (StringUtils.isNotBlank(runManager.loadPipelineRun(pipelineRun.getId()).getServiceUrl())) {
-                return;
+            final PipelineRun pipelineRun = runManager.loadPipelineRun(runId);
+            if (StringUtils.isNotBlank(pipelineRun.getServiceUrl())) {
+                return pipelineRun;
             }
             log.debug("Waiting for run initialization. Try: {}", i + 1);
             waitTimeout(waitTime);
@@ -158,6 +199,7 @@ public class ServerlessConfigurationManager {
     private PipelineRun receivePipelineRun(final Long configurationId, final RunConfiguration configuration) {
         List<PipelineRun> activeRunsForConfiguration = loadActiveRuns(configurationId);
         if (CollectionUtils.isEmpty(activeRunsForConfiguration)) {
+            log.debug("No active runs found. A new run will be launched");
             activeRunsForConfiguration = configurationRunner.runConfiguration(null,
                     runConfigurationMapper.toRunConfigurationWithEntitiesVO(configuration), null);
         }
@@ -223,12 +265,18 @@ public class ServerlessConfigurationManager {
                 appPath));
     }
 
-    private String buildApplicationUrl(final HttpServletRequest request, final String endpointName) {
-        final String appPath = String.format("%s/%s",
-                StringUtils.stripEnd(endpointName, "/"), getApplicationPath(request));
-        return StringUtils.isNotBlank(request.getQueryString())
-                ? String.format("%s?%s", appPath, request.getQueryString())
-                : appPath;
+    private String buildApplicationUrl(final HttpServletRequest request, final String endpoint) {
+        try {
+            final URL endpointUrl = new URL(endpoint);
+            final String appHost = getApplicationHost(endpointUrl);
+            final int appPort = getApplicationPort(endpointUrl);
+            final String requestPath = getApplicationPath(request);
+            final String endpointPath = getEndpointPath(endpointUrl);
+            return UrlUtils.buildFullRequestUrl(endpointUrl.getProtocol(), appHost, appPort,
+                    String.format("%s/%s", endpointPath, requestPath), request.getQueryString());
+        } catch (MalformedURLException e) {
+            throw new IllegalArgumentException(e);
+        }
     }
 
     private String getApplicationPath(final HttpServletRequest request) {
@@ -239,9 +287,24 @@ public class ServerlessConfigurationManager {
 
     private HttpHeaders buildHttpHeaders(final HttpServletRequest request) {
         final HttpHeaders headers = new HttpHeaders();
-        Collections.list(request.getHeaderNames())
+        final List<String> headerNames = Collections.list(request.getHeaderNames());
+        final Cookie[] cookies = request.getCookies();
+        if (hasNotBearerCookie(cookies)) {
+            final String token = ((UserContext) authManager.getAuthentication().getPrincipal()).getJwtRawToken()
+                    .getToken();
+            headers.add(HttpHeaders.COOKIE, Objects.isNull(cookies)
+                    ? String.format("%s=%s", BEARER_COOKIE_NAME, token)
+                    : String.format("%s; %s=%s", request.getHeader(HttpHeaders.COOKIE), BEARER_COOKIE_NAME, token));
+        }
+        headerNames.stream()
+                .filter(headerName -> !(HttpHeaders.COOKIE.equals(headerName) && hasNotBearerCookie(cookies)))
                 .forEach(headerName -> headers.add(headerName, request.getHeader(headerName)));
         return headers;
+    }
+
+    private boolean hasNotBearerCookie(final Cookie[] cookies) {
+        return !Objects.nonNull(cookies) || Arrays.stream(cookies)
+                .noneMatch(cookie -> BEARER_COOKIE_NAME.equalsIgnoreCase(cookie.getName()));
     }
 
     private RestTemplate buildRestTemplate() throws KeyStoreException, NoSuchAlgorithmException,
@@ -276,5 +339,29 @@ public class ServerlessConfigurationManager {
         } catch (InterruptedException e) {
             throw new IllegalArgumentException(e);
         }
+    }
+
+    private String getApplicationHost(final URL endpointUrl) {
+        return StringUtils.isNotBlank(edgeInternalHost) && !edgeInternalHost.equalsIgnoreCase(endpointUrl.getHost())
+                ? edgeInternalHost
+                : endpointUrl.getHost();
+    }
+
+    private int getApplicationPort(final URL endpointUrl) {
+        Assert.state(endpointUrl.getPort() != -1, "Port is required");
+        return Objects.nonNull(edgeInternalPort) && !edgeInternalPort.equals(endpointUrl.getPort())
+                ? edgeInternalPort
+                : endpointUrl.getPort();
+    }
+
+    private String normalizeRequestPath(final String appRequestPath) {
+        return appRequestPath.startsWith(PATH_DELIMITER) ? appRequestPath : PATH_DELIMITER + appRequestPath;
+    }
+
+    private String getEndpointPath(final URL endpointUrl) {
+        if (StringUtils.isBlank(endpointUrl.getPath())) {
+            return StringUtils.EMPTY;
+        }
+        return StringUtils.stripEnd(normalizeRequestPath(endpointUrl.getPath()), PATH_DELIMITER);
     }
 }

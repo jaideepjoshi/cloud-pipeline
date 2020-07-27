@@ -39,6 +39,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.Optional;
 
 @Service
 @RequiredArgsConstructor
@@ -63,6 +64,8 @@ public class S3TemporaryCredentialsGenerator implements TemporaryCredentialsGene
     private static final String KMS_GENERATE_DATA_KEY_ACTION = "kms:GenerateDataKey*";
     private static final String KMS_DESCRIBE_KEY_ACTION = "kms:DescribeKey";
     private static final String ARN_AWS_S3_PREFIX = "arn:aws:s3:::";
+    private static final String ACTION = "Action";
+    private static final String RESOURCE = "Resource";
 
     private final CloudRegionManager cloudRegionManager;
     private final PreferenceManager preferenceManager;
@@ -78,11 +81,12 @@ public class S3TemporaryCredentialsGenerator implements TemporaryCredentialsGene
 
         final Integer duration =
                 preferenceManager.getPreference(SystemPreferences.DATA_STORAGE_TEMP_CREDENTIALS_DURATION);
-        final String role = awsRegion.getTempCredentialsRole();
+        final String role = Optional.ofNullable(dataStorage.getTempCredentialsRole())
+                .orElse(awsRegion.getTempCredentialsRole());
         final String sessionName = "SessionID-" + PasswordGenerator.generateRandomString(10);
 
-
-        final String policy = createPolicyWithPermissions(actions, awsRegion.getKmsKeyArn());
+        //TODO: handle situation when we have actions for different storages with different KMS keys
+        final String policy = createPolicyWithPermissions(actions, AWSUtils.getKeyArnValue(dataStorage, awsRegion));
         final AssumeRoleRequest assumeRoleRequest = new AssumeRoleRequest()
                 .withDurationSeconds(duration)
                 .withPolicy(policy)
@@ -119,46 +123,59 @@ public class S3TemporaryCredentialsGenerator implements TemporaryCredentialsGene
             addKmsActionToStatement(kmsArn, statements);
         }
         for (DataStorageAction action : actions) {
-            addActionToStatement(action, statements, true);
-            addActionToStatement(action, statements, false);
+            if (action.isList() || action.isRead() || action.isWrite()) {
+                addListingPermissions(action, statements);
+            }
+            if (action.isRead() || action.isWrite()) {
+                addActionToStatement(action, statements);
+            }
         }
         return resultPolicy.toString();
     }
 
-    private void addActionToStatement(final DataStorageAction dataStorageActions, final ArrayNode statements,
-                                      final boolean listBucket) {
-        final ObjectNode statement = JsonNodeFactory.instance.objectNode();
-        statement.put("Effect", "Allow");
-        final ArrayNode actions = statement.putArray("Action");
-        if (listBucket) {
-            actions.add(LIST_OBJECTS_ACTION);
-            if (dataStorageActions.isReadVersion()) {
-                actions.add(LIST_VERSIONS_ACTION);
-            }
-        } else {
-            if (dataStorageActions.isRead()) {
-                actions.add(GET_OBJECT_ACTION);
-                actions.add(GET_OBJECT_TAGGING_ACTION);
-                if (dataStorageActions.isReadVersion()) {
-                    actions.add(GET_VERSION_ACTION);
-                    actions.add(GET_OBJECT_VERSION_TAGGING_ACTION);
-                }
-            }
-            if (dataStorageActions.isWrite()) {
-                actions.add(PUT_OBJECT_ACTION);
-                actions.add(DELETE_OBJECT_ACTION);
-                actions.add(PUT_OBJECT_TAGGING_ACTION);
-                actions.add(DELETE_OBJECT_TAGGING_ACTION);
-                if (dataStorageActions.isWriteVersion()) {
-                    actions.add(DELETE_VERSION_ACTION);
-                    actions.add(PUT_OBJECT_VERSION_TAGGING_ACTION);
-                    actions.add(DELETE_OBJECT_VERSION_TAGGING_ACTION);
-                }
+    private void addListingPermissions(final DataStorageAction action, final ArrayNode statements) {
+        final ObjectNode statement = getStatement();
+        final ArrayNode actions = statement.putArray(ACTION);
+        actions.add(LIST_OBJECTS_ACTION);
+        if (action.isListVersion() || action.isWriteVersion() || action.isReadVersion()) {
+            actions.add(LIST_VERSIONS_ACTION);
+        }
+        final ArrayNode resource = statement.putArray(RESOURCE);
+        resource.add(buildS3Arn(action, true));
+        statements.add(statement);
+    }
+
+    private void addActionToStatement(final DataStorageAction action, final ArrayNode statements) {
+        final ObjectNode statement = getStatement();
+        final ArrayNode actions = statement.putArray(ACTION);
+        if (action.isRead()) {
+            actions.add(GET_OBJECT_ACTION);
+            actions.add(GET_OBJECT_TAGGING_ACTION);
+            if (action.isReadVersion()) {
+                actions.add(GET_VERSION_ACTION);
+                actions.add(GET_OBJECT_VERSION_TAGGING_ACTION);
             }
         }
-        final ArrayNode resource = statement.putArray("Resource");
-        resource.add(buildS3Arn(dataStorageActions, listBucket));
+        if (action.isWrite()) {
+            actions.add(PUT_OBJECT_ACTION);
+            actions.add(DELETE_OBJECT_ACTION);
+            actions.add(PUT_OBJECT_TAGGING_ACTION);
+            actions.add(DELETE_OBJECT_TAGGING_ACTION);
+            if (action.isWriteVersion()) {
+                actions.add(DELETE_VERSION_ACTION);
+                actions.add(PUT_OBJECT_VERSION_TAGGING_ACTION);
+                actions.add(DELETE_OBJECT_VERSION_TAGGING_ACTION);
+            }
+        }
+        final ArrayNode resource = statement.putArray(RESOURCE);
+        resource.add(buildS3Arn(action, false));
         statements.add(statement);
+    }
+
+    private ObjectNode getStatement() {
+        final ObjectNode statement = JsonNodeFactory.instance.objectNode();
+        statement.put("Effect", "Allow");
+        return statement;
     }
 
     private String buildS3Arn(final DataStorageAction action, final boolean list) {
@@ -167,15 +184,14 @@ public class S3TemporaryCredentialsGenerator implements TemporaryCredentialsGene
     }
 
     private void addKmsActionToStatement(final String kmsArn, final ArrayNode statements) {
-        final ObjectNode statement = JsonNodeFactory.instance.objectNode();
-        statement.put("Effect", "Allow");
-        final ArrayNode actions = statement.putArray("Action");
+        final ObjectNode statement = getStatement();
+        final ArrayNode actions = statement.putArray(ACTION);
         actions.add(KMS_DECRYPT_ACTION);
         actions.add(KMS_ENCRYPT_ACTION);
         actions.add(KMS_REENCRYPT_ACTION);
         actions.add(KMS_GENERATE_DATA_KEY_ACTION);
         actions.add(KMS_DESCRIBE_KEY_ACTION);
-        statement.put("Resource", kmsArn);
+        statement.put(RESOURCE, kmsArn);
         statements.add(statement);
     }
 }
