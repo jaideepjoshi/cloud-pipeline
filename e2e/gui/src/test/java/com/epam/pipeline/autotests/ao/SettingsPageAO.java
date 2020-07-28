@@ -475,20 +475,10 @@ public class SettingsPageAO extends PopupAO<SettingsPageAO, PipelinesLibraryAO> 
                     SelenideElement entry = getUser(name.toUpperCase()).shouldBe(visible);
                     new UserEntry(this, name.toUpperCase(), entry)
                             .edit()
-                            .delete();
-                    confirmUserDeletion(name);
+                            .delete(name);
                 }
                 return this;
             }
-
-            private UsersTabAO confirmUserDeletion(final String name) {
-                new ConfirmationPopupAO(this.parentAO)
-                        .ensureTitleIs(String.format("Are you sure you want to delete user %s?", name.toUpperCase()))
-                        .sleep(1, SECONDS)
-                        .click(OK);
-                return this;
-            }
-
 
             public class UserEntry implements AccessObject<SystemEventsEntry> {
                 private final UsersTabAO parentAO;
@@ -545,9 +535,9 @@ public class SettingsPageAO extends PopupAO<SettingsPageAO, PipelinesLibraryAO> 
                         return parentAO;
                     }
 
-                    public UsersTabAO delete() {
+                    public UsersTabAO delete(String name) {
                         click(DELETE);
-                        return parentAO;
+                        return confirmUserDeletion(name);
                     }
 
                     public EditUserPopup validateRoleAppearedInSearch(String role) {
@@ -576,6 +566,14 @@ public class SettingsPageAO extends PopupAO<SettingsPageAO, PipelinesLibraryAO> 
                                 .find(By.id("delete-role-button"))
                                 .click();
                         return this;
+                    }
+
+                    private UsersTabAO confirmUserDeletion(final String name) {
+                        new ConfirmationPopupAO(parentAO)
+                                .ensureTitleIs(String.format("Are you sure you want to delete user %s?", name.toUpperCase()))
+                                .sleep(1, SECONDS)
+                                .click(OK);
+                        return parentAO;
                     }
                 }
             }
