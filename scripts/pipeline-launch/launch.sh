@@ -1532,7 +1532,20 @@ fi
 
 ######################################################
 
+######################################################
+# Setup NoMachine
+######################################################
 
+echo "Setup NoMachine environment"
+echo "-"
+
+if [ "$CP_CAP_DESKTOP_NM" == "true" ]; then
+      nomachine_setup
+else
+    echo "NoMachine support is not requested"
+fi
+
+######################################################
 
 ######################################################
 echo Executing task
